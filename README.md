@@ -51,6 +51,12 @@ We implemented a centralized engine (RouteOptimizer) that routes requests to spe
 
 2. The "SciPy" Engine: By wrapping SciPy's C-based solvers, we bypass the Python Global Interpreter Lock (GIL) and object overhead for the heavy computational lifting.
 
+3. 3. A* Heuristic Correction
+
+We identified a critical edge case where round(distance) in graph generation created Inadmissible Heuristics (where $H(n)>TrueCost)$.
+- The Fix: We implemented a heuristic using floor(distance * 0.9999).
+- Result: This guarantees $H(n)≤C(n)$ even with floating-point rounding errors, restoring A*'s optimality guarantees.
+
 ## Analysis & Findings
 
 ### 1. The "Implementation Gap"
@@ -63,6 +69,12 @@ Bellman-Ford demonstrated its O(N3) complexity perfectly. While fast for small g
 
 ### 3. Correctness Verification
 We validated that for non-negative graphs, all three algorithms return identical path costs (within floating-point tolerance), confirming the mathematical correctness of the implementation and the A* heuristic fix.
+
+### 4. Negative Cycles & Reachability
+When Negative Weights are enabled with high connectivity (e.g., C=0.8), the Bellman-Ford algorithm frequently returns no solution.
+
+This is correct behavior, not a bug. In dense random graphs with negative edges, the probability of forming a Negative Weight Cycle approaches 100%.
+
 
 ## How to Run
 To reproduce the experiments, benchmarks, and generate the dataset:
