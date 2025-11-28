@@ -10,6 +10,7 @@ from time import perf_counter, time
 
 # Import our optimized engine
 from algorithms.network_engine import RouteOptimizer
+from scipy.sparse.csgraph import NegativeCycleError
 
 # --- Configuration Parameters ---
 NODE_COUNTS = [10, 20, 50, 100, 200, 500]
@@ -21,10 +22,27 @@ ALLOW_NEGATIVE_WEIGHTS = [False, True]
 
 def synthesize_network(node_count: int, *, connectivity: float = 1.0, 
                        allow_negatives: bool = False, distortion: float = 0.0, 
-                       seed: int = 42) -> tuple:
+                       seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
     """
     Generates graph data using vectorized NumPy operations.
+    
+    Args:
+        node_count: Number of nodes in the graph (must be > 0)
+        connectivity: Edge probability between 0.0 and 1.0
+        allow_negatives: Whether to allow negative edge weights
+        distortion: Noise level between 0.0 and 1.0
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Tuple of (adjacency_matrix, coordinates)
     """
+    if node_count <= 0:
+        raise ValueError(f"node_count must be positive, got {node_count}")
+    if not 0.0 <= connectivity <= 1.0:
+        raise ValueError(f"connectivity must be between 0.0 and 1.0, got {connectivity}")
+    if not 0.0 <= distortion <= 1.0:
+        raise ValueError(f"distortion must be between 0.0 and 1.0, got {distortion}")
+    
     rng = np.random.default_rng(seed)
     
     # 1. Generate Coordinates
@@ -56,24 +74,11 @@ def synthesize_network(node_count: int, *, connectivity: float = 1.0,
 def audit_network_for_negatives(matrix: np.ndarray) -> bool:
     return np.any(matrix < 0)
 
-def plot_convergence(histories, title, filename=None):
-    """Plots convergence history for analysis."""
-    plt.figure(figsize=(12, 6))
-    for name, history in histories.items():
-        plt.plot(history, label=f"{name} (Final: {history[-1]:.2f})", linewidth=2)
-    plt.xlabel("Iterations")
-    plt.ylabel("Best Cost")
-    plt.title(f"Convergence Comparison: {title}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    if filename:
-        plt.savefig(filename)
-        print(f"Plot saved to {filename}")
-    plt.close()
+# Note: plot_convergence function removed as it's unused in the current implementation
 
 # --- Experiment Execution ---
 
-def execute_trial(nodes, conn, distort, use_neg):
+def execute_trial(nodes: int, conn: float, distort: float, use_neg: bool) -> str:
     # 1. Create Data
     adj_matrix, coords = synthesize_network(
         nodes, 
@@ -105,7 +110,7 @@ def execute_trial(nodes, conn, distort, use_neg):
     if has_neg:
         try:
             bf_dists, bf_preds = RouteOptimizer.compute_all_pairs(adj_matrix, method='BF')
-        except Exception:
+        except NegativeCycleError:
             cycle_detected = True
 
     # -- Solver C: A* --
@@ -161,7 +166,7 @@ def execute_trial(nodes, conn, distort, use_neg):
     return f"Completed: {file_id}"
 
 
-def analyze_apsp_performance(node_counts, connectivity=0.5, runs=3):
+def analyze_apsp_performance(node_counts: list[int], connectivity: float = 0.5, runs: int = 3) -> dict[str, list[float]]:
     """
     Benchmarks execution time AND validates correctness against Dijkstra.
     """
@@ -210,7 +215,14 @@ def analyze_apsp_performance(node_counts, connectivity=0.5, runs=3):
             times_bf.append(perf_counter() - t0)
             
             # Check BF consistency (floating point tolerance)
-            if not np.allclose(d_dist, bf_dist, equal_nan=True):
+            # Since weights are rounded integers, use rtol=1e-5 for comparison
+            # Check both finite and infinite values correctly
+            finite_mask = np.isfinite(d_dist) & np.isfinite(bf_dist)
+            if np.any(finite_mask):
+                if not np.allclose(d_dist[finite_mask], bf_dist[finite_mask], rtol=1e-5, atol=1e-5):
+                    errors += 1
+            # Both should have same infinite patterns
+            if np.any(np.isfinite(d_dist) != np.isfinite(bf_dist)):
                 errors += 1
 
             # 4. Run A* (Skip for huge graphs)
@@ -221,14 +233,20 @@ def analyze_apsp_performance(node_counts, connectivity=0.5, runs=3):
                 
                 # Check A* consistency
                 # A* returns a dict of dicts, so we convert to matrix for comparison
-                # (Simplified check: just checking random node pairs would be faster)
                 a_matrix = np.full((n, n), np.inf)
                 for s, targets in a_data[0].items():
                     for t, cost in targets.items():
-                        a_matrix[s, t] = cost
+                        if cost is not None and not np.isinf(cost):
+                            a_matrix[s, t] = cost
                 
                 # A* finds optimal paths, so it must match Dijkstra
-                if not np.allclose(d_dist, a_matrix, equal_nan=True):
+                # Check finite values with tolerance for integer weights
+                finite_mask = np.isfinite(d_dist) & np.isfinite(a_matrix)
+                if np.any(finite_mask):
+                    if not np.allclose(d_dist[finite_mask], a_matrix[finite_mask], rtol=1e-5, atol=1e-5):
+                        errors += 1
+                # Both should have same infinite patterns (unreachable nodes)
+                if np.any(np.isfinite(d_dist) != np.isfinite(a_matrix)):
                     errors += 1
             else:
                 times_a.append(None)
@@ -250,7 +268,7 @@ def analyze_apsp_performance(node_counts, connectivity=0.5, runs=3):
     print("-" * 75)
     return results
 
-def plot_apsp_benchmark(results, node_counts):
+def plot_apsp_benchmark(results: dict[str, list[float]], node_counts: list[int]) -> None:
     """
     Visualizes the Time vs. Size complexity of the algorithms.
     """
@@ -293,10 +311,11 @@ if __name__ == "__main__":
     print(f"Starting APSP parallel execution on {os.cpu_count()} cores...")
     t_start = perf_counter()
     
-    """Parallel(n_jobs=-1)( # Uncomment to run all experiments
-        delayed(execute_trial)(n, c, d, neg)
-        for n, c, d, neg in experimental_grid
-    )"""
+    # Uncomment the following block to run full experimental grid in parallel:
+    # Parallel(n_jobs=-1)(
+    #     delayed(execute_trial)(n, c, d, neg)
+    #     for n, c, d, neg in experimental_grid
+    # )
     
     benchmark_data = analyze_apsp_performance(
         node_counts=NODE_COUNTS, 
